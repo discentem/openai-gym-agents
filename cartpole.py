@@ -5,14 +5,18 @@ import numpy as np
 import shutil
 
 class ExperienceQModel(object):
-    def __init__(self, env, monitor_file, log_dir, max_memory=10000, discount=.9, n_episodes=100, 
-                 n_steps=100, batch_size=100, learning_rate = 0.01, dropout = 1.0,
+    def __init__(self, env, log_dir, monitor_file=None, max_memory=10000, discount=.9, n_episodes=300, 
+                 n_steps=200, batch_size=100, learning_rate = 0.01, dropout_keep_prob = 1.0,
                  exploration=lambda x: 0.1, stop_training=10):
         
         # Memory replay parameters
         self.max_memory = max_memory
         self.memory = list()
         self.discount = discount
+
+        # episode scores
+        self.game_scores = list()
+        self.game_score = 0.
 
         # exploration
         self.eps = exploration # epsilon-greedy as function of epoch
@@ -35,15 +39,15 @@ class ExperienceQModel(object):
         # Neural Network Parameters
         self.n_hidden_1 = self.n_states
         
-        # Initialize tensor flow parameters
+        # Initialize tensorflow parameters
         self.x = tf.placeholder(tf.float32, [None, self.n_states],name='states')
         self.y = tf.placeholder(tf.float32, [None, self.n_actions],name='qvals')
-        self.keep_prob = dropout
+        self.keep_prob = dropout_keep_prob
         self.dropout = tf.placeholder(tf.float32,name='dropout')
         
-        # Tensorboard directory
+        # Tensorboard directory - try to clean if exists
         try:
-            shutil.rmtree(log_dir) #clean
+            shutil.rmtree(log_dir)
         except:
             pass
         self.log_dir = log_dir
@@ -51,14 +55,21 @@ class ExperienceQModel(object):
         # define graph
         self.tf_define_model()
 
+    # update game score
+    def update_game_score(self,episode_score):
+        self.game_scores.append(episode_score)
+        if len(self.game_scores) > 100:
+            del self.game_scores[0]
+        self.game_score = np.mean(self.game_scores)
+
     # process reward
     def exp_process_reward(self,ts,reward,endgame):
-        # if ts < self.n_steps-1 and endgame == True:
-        #     reward = -1.0*ts/5.0 #penalize last moves
-        # if ts == self.n_steps-1 and endgame == True:
-        #     reward = ts #win
-        # if endgame == True:
-            # reward = 1.0*ts
+        if ts <= self.n_steps-1 and endgame == True:
+            reward = -1.
+        elif ts == self.n_steps-1 and endgame == False:
+            reward = 1.
+        else:
+            reward = 0.
         return reward
 
     # saving to memory
@@ -67,7 +78,7 @@ class ExperienceQModel(object):
         if len(self.memory) > self.max_memory:
           del self.memory[0]
 
-    # based on https://gist.github.com/EderSantana/c7222daa328f0e885093
+    # getting batch of the memory
     def exp_get_batch(self):
         len_memory = len(self.memory)
         n_examples = min(len_memory, self.batch_size)
@@ -80,12 +91,12 @@ class ExperienceQModel(object):
             # input
             inputs[i] = states['state_t'].astype(np.float32)
 
-            # targets - not correcting those which are not taken
-            feed_dict = {self.x: states['state_t'].reshape(1,-1), self.dropout: 1.0}
+            # targets - not correcting those which are not taken, use prediction
+            feed_dict = {self.x: states['state_t'].reshape(1,-1), self.dropout: self.keep_prob}
             targets[i] = self.session.run(self.predictor, feed_dict)
             
             # acted action
-            feed_dict = {self.x: states['state_tp1'].reshape(1,-1), self.dropout: 1.0}
+            feed_dict = {self.x: states['state_tp1'].reshape(1,-1), self.dropout: self.keep_prob}
             Qsa = np.max(self.session.run(self.predictor, feed_dict))
 
             # check if endgame and if not use Bellman's equation
@@ -148,8 +159,8 @@ class ExperienceQModel(object):
             tf.scalar_summary('dropout_probability', self.dropout)
             dropped = tf.nn.dropout(hidden1, self.dropout)
 
-        out = self.tf_nn_layer(dropped, self.n_hidden_1, self.n_actions, 'out', act=tf.identity)
-        return out
+        qout = self.tf_nn_layer(dropped, self.n_hidden_1, self.n_actions, 'qvalues', act=tf.identity)
+        return qout
     
 
     # Construct model
@@ -164,7 +175,7 @@ class ExperienceQModel(object):
 
         # Loss
         with tf.name_scope('Loss'):
-            self.loss = tf.reduce_sum(tf.pow(self.predictor-self.y, 2)/(2*self.batch_size))
+            self.loss = tf.reduce_mean(tf.square(self.y - self.predictor))
 
         # Define optimizer
         with tf.name_scope('SGD'):
@@ -193,8 +204,10 @@ class ExperienceQModel(object):
             # restart episode
             state_tp1 = self.env.reset()
             endgame = False
-            avg_loss = 0.
-            avg_max_qval = 0.
+            sum_avg_loss = 0.
+            sum_max_qval = 0.
+            n_explorations = 0.
+            episode_score = 0.
             states = {}
 
             for t in range(self.n_steps):
@@ -203,29 +216,32 @@ class ExperienceQModel(object):
         
                 # epsilon-greedy exploration
                 if self.consec_wins < self.stop_training and np.random.rand() <= self.eps(epoch):
+                    n_explorations += 1
                     action = self.env.action_space.sample()
                 else:
-                    feed_dict = {self.x: state_t1.reshape(1,-1), self.dropout: 1.0}
+                    feed_dict = {self.x: state_t1.reshape(1,-1), self.dropout: self.keep_prob}
                     qvals = self.session.run(self.predictor, feed_dict)
-                    avg_max_qval += np.max(qvals)
+                    sum_max_qval += np.max(qvals)
                     action = np.argmax(qvals)
 
                 # take a next step
                 state_tp1, reward, endgame, info = self.env.step(action)
+                # print("{:4d}: {}".format(t,endgame))
 
                 # process reward
                 reward = self.exp_process_reward(t,reward,endgame)
+                episode_score = episode_score + 1.0
 
                 #store experience
                 states['action'] = action
-                states['reward'] = float(reward)/10
+                states['reward'] = float(reward)
                 states['endgame'] = endgame
                 states['state_t'] = np.array(state_t1)
                 states['state_tp1'] = np.array(state_tp1)
                 self.exp_save_to_memory(states)
 
                 # Training loop
-                if self.consec_wins < self.stop_training:
+                if self.game_score < 195:
                     # get experience replay
                     x_batch, y_batch = self.exp_get_batch()
                     # create feed dictionary
@@ -237,30 +253,25 @@ class ExperienceQModel(object):
                     self.global_step += x_batch.shape[0]
                     self.summary_writer.add_summary(summary,self.global_step)
                     # avg loss
-                    avg_loss += loss
+                    sum_avg_loss += loss
 
                 # Check if lost or not
-                if endgame == True:
+                if (endgame == True) or (endgame == False and t == self.n_steps-1):
+                    self.update_game_score(episode_score)
+                    print("{:4d}: score={:8.1f}, loss={:6.2f}, max qval={:6.2f}, exp={:6.2f}, game score={:6.2f}".
+                        format(epoch+1,episode_score,sum_avg_loss/t,sum_max_qval/t,n_explorations/t,self.game_score))
                     if (t == self.n_steps-1):
                         self.consec_wins +=1
-                        print("{:4d}: won!".format(epoch+1))
+                        episode_score = 0
                         break
                     else:
                         self.consec_wins = 0
-                        print("{:4d}: lost after {:3d}, cost {:8.4f}, qval {:8.4f}".
-                                format(epoch+1,t+1,avg_loss/t,avg_max_qval/t))
+                        episode_score = 0
                         break
 
         # close monitor session
         if self.monitor_file:
             self.env.monitor.close()
-
-    # submit result for the leaderboard
-    def submit_result(self,algo_id,api_key):
-        gym.upload(self.monitor_file,
-            algorithm_id=algo_id,
-            api_key=api_key,
-            ignore_open_monitors=False)
 
 
 if __name__ == "__main__":
@@ -273,15 +284,11 @@ if __name__ == "__main__":
         discount=.90,\
         n_episodes=400,\
         n_steps=200,\
-        batch_size=256,\
+        batch_size=128,\
         learning_rate = 1.e-3,\
-        dropout = 1.0,\
-        exploration = lambda x: 0.1 if x<50 else 0,\
+        dropout_keep_prob = 1.0,\
+        exploration = lambda x: (60-x)/100. if x<30 else 0.1,\
         stop_training = 10
     )
 
     model.tf_train_model()
-
-    # model.submit_result(
-        # algo_id='alg_BjyWQTp1TCq9zSVyEtXTA',\
-        # api_key='sk_7355XBGvTiqI1GxxakqSYw')
