@@ -1,5 +1,4 @@
 import gym
-from gym import wrappers
 import re
 import tensorflow as tf
 import numpy as np
@@ -10,14 +9,15 @@ class ExperienceQModel(object):
                  n_steps=200, batch_size=100, learning_rate = 0.01, dropout_keep_prob = 1.0,
                  exploration=lambda x: 0.1, stop_training=10):
         
-        # Memory replay parameters
+        # Memory replay parameters - heap implementation
         self.max_memory = max_memory
-        self.memory = list()
+        self.memory = []
         self.discount = discount
 
         # episode scores
         self.game_scores = list()
         self.game_score = 0.
+        self.episode_score = 0.
 
         # exploration
         self.eps = exploration # epsilon-greedy as function of epoch
@@ -65,12 +65,17 @@ class ExperienceQModel(object):
 
     # process reward
     def exp_process_reward(self,ts,reward,endgame):
-        if ts <= self.n_steps-1 and endgame == True:
-            reward = -1.
-        elif ts == self.n_steps-1 and endgame == False:
-            reward = 1.
-        else:
-            reward = 0.
+        self.episode_score += reward
+        # reducing endgame penalty
+        # if (endgame) & (reward == -100):
+            # reward = -30.
+        # if reward > 0:
+            # reward = reward * 3.
+        # assigning penalty for flying too long
+        if (endgame) & (ts == 999):
+            reward = -100.
+        # normalizing rewards
+        # reward = reward / 10.
         return reward
 
     # saving to memory
@@ -121,13 +126,13 @@ class ExperienceQModel(object):
     def tf_variable_summaries(self,var, name):
         with tf.name_scope('summaries'):
             mean = tf.reduce_mean(var)
-            tf.summary.scalar('mean/' + name, mean)
+            tf.scalar_summary('mean/' + name, mean)
             with tf.name_scope('stddev'):
                 stddev = tf.sqrt(tf.reduce_sum(tf.square(var - mean)))
-                tf.summary.scalar('sttdev/' + name, stddev)
-                tf.summary.scalar('max/' + name, tf.reduce_max(var))
-                tf.summary.scalar('min/' + name, tf.reduce_min(var))
-                tf.summary.histogram(name, var)
+                tf.scalar_summary('sttdev/' + name, stddev)
+                tf.scalar_summary('max/' + name, tf.reduce_max(var))
+                tf.scalar_summary('min/' + name, tf.reduce_min(var))
+                tf.histogram_summary(name, var)
 
     # Aux function to define layers
     def tf_nn_layer(self, input_tensor, input_dim, output_dim, layer_name, act=tf.nn.relu):
@@ -145,9 +150,9 @@ class ExperienceQModel(object):
 
             with tf.name_scope('Wx_plus_b'):
                 preactivate = tf.add(tf.matmul(input_tensor, weights),biases)
-                tf.summary.histogram(layer_name + '/pre_activations', preactivate)
+                tf.histogram_summary(layer_name + '/pre_activations', preactivate)
                 activations = act(preactivate, 'activation')
-                tf.summary.histogram(layer_name + '/activations', activations)
+                tf.histogram_summary(layer_name + '/activations', activations)
 
             return activations
 
@@ -157,7 +162,7 @@ class ExperienceQModel(object):
         hidden1 = self.tf_nn_layer(self.x, self.n_hidden_1, self.n_hidden_1, 'layer1', act=tf.nn.relu)
 
         with tf.name_scope('dropout'):
-            tf.summary.scalar('dropout_probability', self.dropout)
+            tf.scalar_summary('dropout_probability', self.dropout)
             dropped = tf.nn.dropout(hidden1, self.dropout)
 
         qout = self.tf_nn_layer(dropped, self.n_hidden_1, self.n_actions, 'qvalues', act=tf.identity)
@@ -183,21 +188,21 @@ class ExperienceQModel(object):
             self.train_op = tf.train.AdamOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
 
         # Prepare summaries
-        tf.summary.scalar('loss', self.loss)
+        tf.scalar_summary('loss', self.loss)
 
         # Summary writer
-        self.merged_summary_op = tf.summary.merge_all()
-        self.summary_writer = tf.summary.FileWriter(self.log_dir + '/train', graph=tf.get_default_graph())
+        self.merged_summary_op = tf.merge_all_summaries()
+        self.summary_writer = tf.train.SummaryWriter(self.log_dir + '/train', graph=tf.get_default_graph())
 
         # Initializing the session
-        self.session.run(tf.global_variables_initializer())
+        self.session.run(tf.initialize_all_variables())
 
 
     # Train loop
     def tf_train_model(self):
         # start open ai monitor
         if self.monitor_file:
-            self.env = wrappers.Monitor(self.env,self.monitor_file,force=True)
+            self.env.monitor.start(self.monitor_file,force=True)
 
         # Training cycle
         for epoch in range(self.n_episodes):
@@ -208,7 +213,6 @@ class ExperienceQModel(object):
             sum_avg_loss = 0.
             sum_max_qval = 0.
             n_explorations = 0.
-            episode_score = 0.
             states = {}
 
             for t in range(self.n_steps):
@@ -227,11 +231,10 @@ class ExperienceQModel(object):
 
                 # take a next step
                 state_tp1, reward, endgame, info = self.env.step(action)
-                # print("{:4d}: {}".format(t,endgame))
 
                 # process reward
                 reward = self.exp_process_reward(t,reward,endgame)
-                episode_score = episode_score + 1.0
+                # print("{:6.2f}".format(reward))
 
                 #store experience
                 states['action'] = action
@@ -258,16 +261,16 @@ class ExperienceQModel(object):
 
                 # Check if lost or not
                 if (endgame == True) or (endgame == False and t == self.n_steps-1):
-                    self.update_game_score(episode_score)
-                    print("{:4d}: score={:8.1f}, loss={:6.2f}, max qval={:6.2f}, exp={:6.2f}, game score={:6.2f}".
-                        format(epoch+1,episode_score,sum_avg_loss/t,sum_max_qval/t,n_explorations/t,self.game_score))
+                    self.update_game_score(self.episode_score)
+                    print("{:4d}: score={:8.1f}, loss={:6.2f}, max qval={:6.2f}, exp={:6.2f}, steps={:5d}, game score={:6.2f}".
+                        format(epoch+1,self.episode_score,sum_avg_loss/t,sum_max_qval/t,n_explorations/t,t,self.game_score))
                     if (t == self.n_steps-1):
                         self.consec_wins +=1
-                        episode_score = 0
+                        self.episode_score = 0
                         break
                     else:
                         self.consec_wins = 0
-                        episode_score = 0
+                        self.episode_score = 0
                         break
 
         # close monitor session
@@ -278,17 +281,17 @@ class ExperienceQModel(object):
 if __name__ == "__main__":
 
     model = ExperienceQModel(
-        env='CartPole-v0',\
-        monitor_file = 'results/cartpole',\
-        log_dir = '/tmp/tf/cartpole-256_1e-3_norm',\
-        max_memory=40000,\
+        env='LunarLander-v2',\
+        monitor_file = 'results/lunarlander',\
+        log_dir = '/tmp/tf/lunarlander-256_1e-3_norm',\
+        max_memory=500000,\
         discount=.90,\
-        n_episodes=400,\
-        n_steps=200,\
-        batch_size=128,\
+        n_episodes=3000,\
+        n_steps=2000,\
+        batch_size=32,\
         learning_rate = 1.e-3,\
         dropout_keep_prob = 1.0,\
-        exploration = lambda x: (60-x)/100. if x<30 else 0.1,\
+        exploration = lambda x: (400-x)/400. if x<340 else 0.15,\
         stop_training = 10
     )
 
