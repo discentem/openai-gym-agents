@@ -5,9 +5,12 @@ import numpy as np
 import shutil
 
 class ExperienceQModel(object):
-    def __init__(self, env, log_dir, monitor_file=None, max_memory=10000, discount=.9, n_episodes=300, 
-                 n_steps=200, batch_size=100, learning_rate = 0.01, dropout_keep_prob = 1.0,
-                 exploration=lambda x: 0.1, stop_training=10):
+    def __init__(
+        self, env, log_dir, monitor_file=None, max_memory=10000,
+        discount=.9, n_episodes=300,
+        n_steps=200, batch_size=100, learning_rate = 0.01,
+        dropout_keep_prob=1.0,
+        exploration=lambda x: 0.1, stop_training=10):
         
         # Memory replay parameters - heap implementation
         self.max_memory = max_memory
